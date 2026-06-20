@@ -122,8 +122,10 @@ command = "python3"
 args = ["/absolute/path/to/obsidian-readonly-mcp/src/obsidian_readonly_mcp.py"]
 
 [mcp_servers.obsidian_readonly.env]
-OBSIDIAN_READONLY_VAULT = "obsidian-vault"
+OBSIDIAN_READONLY_VAULT = "Your Vault Name"
 ```
+
+Use the Obsidian vault name, not the filesystem path. It should be the same value you would pass to `obsidian vault="Your Vault Name" ...`.
 
 Restart Codex or start a new thread so the MCP server is discovered.
 
