@@ -1,0 +1,114 @@
+# Allowed And Excluded Obsidian Commands
+
+## Included
+
+The MCP server includes read-only wrappers for:
+
+- `aliases`
+- `backlinks`
+- `base:query`
+- `base:views`
+- `bases`
+- `bookmarks`
+- `commands`
+- `daily:path`
+- `daily:read`
+- `deadends`
+- `dev:console` without `clear`
+- `dev:css`
+- `dev:dom`
+- `dev:errors` without `clear`
+- `diff`
+- `file`
+- `files`
+- `folder`
+- `folders`
+- `help`
+- `history`
+- `history:list`
+- `history:read`
+- `hotkey`
+- `hotkeys`
+- `links`
+- `orphans`
+- `outline`
+- `plugin`
+- `plugins`
+- `plugins:enabled`
+- `properties`
+- `property:read`
+- `random:read`
+- `read`
+- `recents`
+- `search`
+- `search:context`
+- `snippets`
+- `snippets:enabled`
+- `tabs`
+- `tag`
+- `tags`
+- `tasks` listing only
+- `template:read`
+- `templates`
+- `theme`
+- `themes`
+- `unresolved`
+- `vault`
+- `vaults`
+- `version`
+- `wordcount`
+- `workspace`
+- `workspaces`
+
+## Excluded
+
+The MCP server deliberately excludes:
+
+- `append`
+- `base:create`
+- `bookmark`
+- `command`
+- `create`
+- `daily`
+- `daily:append`
+- `daily:prepend`
+- `delete`
+- `dev:cdp`
+- `dev:console clear`
+- `dev:debug`
+- `dev:errors clear`
+- `dev:mobile`
+- `dev:screenshot`
+- `devtools`
+- `eval`
+- `history:open`
+- `history:restore`
+- `move`
+- `open`
+- `plugin:disable`
+- `plugin:enable`
+- `plugin:install`
+- `plugin:reload`
+- `plugin:uninstall`
+- `plugins:restrict`
+- `prepend`
+- `property:remove`
+- `property:set`
+- `random`
+- `reload`
+- `rename`
+- `restart`
+- `search:open`
+- `snippet:disable`
+- `snippet:enable`
+- `tab:open`
+- `task` update actions
+- `template:insert`
+- `theme:install`
+- `theme:set`
+- `theme:uninstall`
+- `unique`
+- `web`
+- `workspace:delete`
+- `workspace:load`
+- `workspace:save`
