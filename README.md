@@ -4,9 +4,9 @@ Read-only MCP tools for querying a running Obsidian vault from Codex or another 
 
 ## Why this exists
 
-The Obsidian CLI is not just a filesystem reader. Commands such as `backlinks`, `links`, `outline`, and indexed `search` need to talk to the running Obsidian app. In agentic runtimes, the agent's filesystem sandbox can block or destabilize that app/IPC boundary.
+The Obsidian CLI is not just a filesystem reader; it is connected to your main Obsidian app. Commands such as `backlinks`, `links`, `outline`, and indexed `search` need to talk to the running Obsidian app. In agentic runtimes, the agent's filesystem sandbox can block or destabilize that app/IPC boundary. For example, running `obsidian help` inside an agent sandbox can cause the Obsidian app to crash.
 
-Giving the whole agent unsandboxed shell access fixes the IPC problem, but it gives the agent too much power. This MCP server is the narrower solution:
+Giving the whole agent unsandboxed shell access fixes the IPC problem, but it gives the agent too much permission. This MCP server is the narrower solution:
 
 ```text
 sandboxed agent
@@ -39,6 +39,8 @@ It does **not** expose:
 - `obsidian eval`
 - app reload/restart/open/tab/workspace mutation
 - browser/web/open actions
+
+Feel free to modify it to add these features if you need them.
 
 ## Tools
 

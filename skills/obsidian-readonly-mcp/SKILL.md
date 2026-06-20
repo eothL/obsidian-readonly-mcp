@@ -15,7 +15,7 @@ Use the `obsidian_readonly` MCP tools for Obsidian vault inspection. Do not call
    - `mcp__obsidian_readonly__backlinks`
    - `mcp__obsidian_readonly__links`
    - `mcp__obsidian_readonly__outline`
-4. Follow only useful graph neighbors. Prefer specific Tier 1/domain notes over broad hubs.
+4. Follow only useful graph neighbors.
 5. Return a compact graph artifact when the main answer depends on topology:
 
 ```text
