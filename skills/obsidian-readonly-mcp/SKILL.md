@@ -7,6 +7,10 @@ description: Use when reading or exploring an Obsidian vault through the obsidia
 
 Use the `obsidian_readonly` MCP tools for Obsidian vault inspection. Do not call raw `obsidian` CLI when these tools are available.
 
+## Configuration
+
+The MCP server needs access to the running Obsidian app through the Obsidian CLI. If no default vault is configured, pass a `vault` argument to tool calls or ask the user to set `OBSIDIAN_READONLY_VAULT` to their Obsidian vault name.
+
 ## Workflow
 
 1. Start with `mcp__obsidian_readonly__search` or `mcp__obsidian_readonly__search_context`.

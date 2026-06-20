@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "obsidian_readonly": {
+      "command": "python3",
+      "args": [
+        "./src/obsidian_readonly_mcp.py"
+      ]
+    }
+  }
+}

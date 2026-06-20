@@ -1,0 +1,38 @@
+{
+  "name": "obsidian-readonly-mcp",
+  "version": "0.1.0",
+  "description": "Read-only MCP server and Codex skill for querying a running Obsidian vault without giving the agent broad shell access.",
+  "author": {
+    "name": "eothL",
+    "url": "https://github.com/eothL"
+  },
+  "homepage": "https://github.com/eothL/obsidian-readonly-mcp",
+  "repository": "https://github.com/eothL/obsidian-readonly-mcp",
+  "license": "MIT",
+  "keywords": [
+    "obsidian",
+    "mcp",
+    "vault",
+    "readonly",
+    "agents"
+  ],
+  "skills": "./skills/",
+  "mcpServers": "./.mcp.json",
+  "interface": {
+    "displayName": "Obsidian Readonly MCP",
+    "shortDescription": "Read-only Obsidian vault access for sandboxed agents",
+    "longDescription": "Expose read-only Obsidian CLI inspection commands through an MCP server, so Codex can search, read, and inspect graph context without raw unsandboxed shell access.",
+    "developerName": "eothL",
+    "category": "Developer Tools",
+    "capabilities": [
+      "Read"
+    ],
+    "websiteURL": "https://github.com/eothL/obsidian-readonly-mcp",
+    "defaultPrompt": [
+      "Search my Obsidian vault with graph context",
+      "Read this note and inspect backlinks",
+      "Find related notes without editing my vault"
+    ],
+    "brandColor": "#6C31E3"
+  }
+}

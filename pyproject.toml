@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "obsidian-readonly-mcp"
+version = "0.1.0"
+description = "Read-only MCP server for querying a running Obsidian vault through the Obsidian CLI."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [
+  { name = "eothL" }
+]
+keywords = ["obsidian", "mcp", "codex", "agents", "readonly"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Environment :: Console",
+  "License :: OSI Approved :: MIT License",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Topic :: Text Processing :: Indexing"
+]
+
+[project.urls]
+Homepage = "https://github.com/eothL/obsidian-readonly-mcp"
+Repository = "https://github.com/eothL/obsidian-readonly-mcp"
+Issues = "https://github.com/eothL/obsidian-readonly-mcp/issues"
+
+[project.scripts]
+obsidian-readonly-mcp = "obsidian_readonly_mcp:main"
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+py-modules = ["obsidian_readonly_mcp"]

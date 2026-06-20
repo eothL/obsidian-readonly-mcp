@@ -114,7 +114,39 @@ Developer read-only inspection:
 - `dev_css`
 - `dev_dom`
 
-## Install
+## Install With `uvx`
+
+You can run the MCP server directly from GitHub without cloning the repo:
+
+```toml
+[mcp_servers.obsidian_readonly]
+command = "uvx"
+args = [
+  "--from",
+  "git+https://github.com/eothL/obsidian-readonly-mcp",
+  "obsidian-readonly-mcp"
+]
+
+[mcp_servers.obsidian_readonly.env]
+OBSIDIAN_READONLY_VAULT = "Your Vault Name"
+```
+
+Use the Obsidian vault name, not the filesystem path. It should be the same value you would pass to `obsidian vault="Your Vault Name" ...`.
+
+If this package is later published to PyPI, the config can become:
+
+```toml
+[mcp_servers.obsidian_readonly]
+command = "uvx"
+args = ["obsidian-readonly-mcp"]
+
+[mcp_servers.obsidian_readonly.env]
+OBSIDIAN_READONLY_VAULT = "Your Vault Name"
+```
+
+Restart Codex or start a new thread so the MCP server is discovered.
+
+## Install From A Local Clone
 
 Clone this repo somewhere stable, then add the MCP server to your Codex config:
 
@@ -127,9 +159,17 @@ args = ["/absolute/path/to/obsidian-readonly-mcp/src/obsidian_readonly_mcp.py"]
 OBSIDIAN_READONLY_VAULT = "Your Vault Name"
 ```
 
-Use the Obsidian vault name, not the filesystem path. It should be the same value you would pass to `obsidian vault="Your Vault Name" ...`.
-
 Restart Codex or start a new thread so the MCP server is discovered.
+
+## Codex Plugin
+
+This repository also includes Codex plugin metadata:
+
+- `.codex-plugin/plugin.json`
+- `.mcp.json`
+- `skills/obsidian-readonly-mcp/SKILL.md`
+
+The plugin bundles the MCP server and the companion skill so Codex can learn to prefer the read-only Obsidian tools for vault exploration. The plugin MCP config does not hard-code a vault name; set `OBSIDIAN_READONLY_VAULT` in your environment or pass the `vault` argument in tool calls.
 
 ## Usage
 
