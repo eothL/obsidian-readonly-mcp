@@ -4,10 +4,15 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
+import signal
 import subprocess
 import sys
-from pathlib import PurePosixPath
+import time
+import uuid
+from logging.handlers import RotatingFileHandler
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 
@@ -15,6 +20,50 @@ DEFAULT_VAULT = os.environ.get("OBSIDIAN_READONLY_VAULT", "")
 MAX_LIMIT = int(os.environ.get("OBSIDIAN_READONLY_MAX_LIMIT", "100"))
 MAX_OUTPUT_BYTES = int(os.environ.get("OBSIDIAN_READONLY_MAX_OUTPUT_BYTES", "300000"))
 TIMEOUT_SECONDS = int(os.environ.get("OBSIDIAN_READONLY_TIMEOUT_SECONDS", "30"))
+
+if TIMEOUT_SECONDS <= 0:
+    raise ValueError("OBSIDIAN_READONLY_TIMEOUT_SECONDS must be positive")
+
+LOGGER = logging.getLogger("obsidian-readonly-mcp")
+LOGGER.addHandler(logging.NullHandler())
+LOGGER.propagate = False
+
+
+class PrivateRotatingFileHandler(RotatingFileHandler):
+    def _open(self):
+        fd = os.open(self.baseFilename, os.O_CREAT | os.O_APPEND | os.O_WRONLY, 0o600)
+        os.fchmod(fd, 0o600)
+        return os.fdopen(fd, "a", encoding="utf-8")
+
+
+def configure_logging() -> None:
+    """Local metadata only; never send diagnostics to MCP stdout."""
+    setting = os.environ.get("OBSIDIAN_READONLY_LOG_DIR")
+    if setting == "off":
+        return
+    directory = Path(setting) if setting else (
+        Path.home() / "Library" / "Logs" / "obsidian-readonly-mcp"
+        if sys.platform == "darwin" else
+        Path(os.environ.get("XDG_STATE_HOME", str(Path.home() / ".local/state")))
+        / "obsidian-readonly-mcp"
+    )
+    try:
+        directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+        log_path = directory / "server.log"
+        handler = PrivateRotatingFileHandler(
+            log_path, maxBytes=5 * 1024 * 1024, backupCount=2, encoding="utf-8"
+        )
+        LOGGER.addHandler(handler)
+        LOGGER.setLevel(logging.INFO)
+        logging.raiseExceptions = False
+    except OSError:
+        # Avoid leaking paths or exception text and keep the protocol usable.
+        sys.stderr.write("obsidian-readonly-mcp: diagnostic log unavailable\n")
+
+
+def diagnostic(event: str, **fields: Any) -> None:
+    LOGGER.info(json.dumps({"timestamp": time.time(), "pid": os.getpid(),
+                            "event": event, **fields}))
 
 
 class McpError(Exception):
@@ -382,23 +431,67 @@ def build_argv(tool: str, args: dict[str, Any]) -> list[str]:
     raise McpError(-32601, f"unknown tool: {tool}")
 
 
-def run_obsidian(tool: str, args: dict[str, Any]) -> tuple[str, bool]:
+def run_obsidian(tool: str, args: dict[str, Any], *, trace: str | None = None) -> tuple[str, bool]:
     argv = build_argv(tool, args)
+    started = time.monotonic()
+    diagnostic("command_started", trace=trace, tool=tool, timeout_seconds=TIMEOUT_SECONDS)
     try:
-        result = subprocess.run(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=TIMEOUT_SECONDS, check=False)
-    except FileNotFoundError:
-        return "obsidian CLI not found on PATH", True
+        process = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                   start_new_session=(os.name == "posix"))
+    except OSError as exc:
+        diagnostic("command_failed", trace=trace, tool=tool, error_type=type(exc).__name__)
+        return ("obsidian CLI not found on PATH" if isinstance(exc, FileNotFoundError)
+                else "obsidian CLI could not be started"), True
+    try:
+        stdout_bytes, stderr_bytes = process.communicate(timeout=TIMEOUT_SECONDS)
     except subprocess.TimeoutExpired:
-        return f"obsidian command timed out after {TIMEOUT_SECONDS}s", True
+        diagnostic("command_timeout", trace=trace, tool=tool,
+                   elapsed_ms=round((time.monotonic() - started) * 1000))
+        # Kill only the CLI's new process group, including helpers holding its pipes.
+        try:
+            if os.name == "posix":
+                os.killpg(process.pid, signal.SIGKILL)
+            else:
+                process.kill()
+        except ProcessLookupError:
+            pass
+        # Do not call communicate() without a timeout: inherited pipes can stay open.
+        try:
+            process.communicate(timeout=1)
+        except subprocess.TimeoutExpired:
+            if process.stdout:
+                process.stdout.close()
+            if process.stderr:
+                process.stderr.close()
+        diagnostic("command_cleanup", trace=trace, tool=tool, exit_code=process.poll(),
+                   elapsed_ms=round((time.monotonic() - started) * 1000))
+        return f"obsidian command timed out after {TIMEOUT_SECONDS}s; check Obsidian and run health", True
 
-    stdout = result.stdout[:MAX_OUTPUT_BYTES].decode("utf-8", errors="replace")
-    stderr = result.stderr[:MAX_OUTPUT_BYTES].decode("utf-8", errors="replace")
+    diagnostic("command_finished", trace=trace, tool=tool, exit_code=process.returncode,
+               elapsed_ms=round((time.monotonic() - started) * 1000),
+               stdout_bytes=len(stdout_bytes), stderr_bytes=len(stderr_bytes))
+    stdout = stdout_bytes[:MAX_OUTPUT_BYTES].decode("utf-8", errors="replace")
+    stderr = stderr_bytes[:MAX_OUTPUT_BYTES].decode("utf-8", errors="replace")
     text = stdout
     if stderr:
         text = f"{text}\n[stderr]\n{stderr}" if text else stderr
-    if len(result.stdout) > MAX_OUTPUT_BYTES or len(result.stderr) > MAX_OUTPUT_BYTES:
+    if len(stdout_bytes) > MAX_OUTPUT_BYTES or len(stderr_bytes) > MAX_OUTPUT_BYTES:
         text += "\n[obsidian-readonly-mcp: output truncated]\n"
-    return text, result.returncode != 0
+    return text, process.returncode != 0
+
+
+def health(args: dict[str, Any], *, trace: str | None = None) -> tuple[str, bool]:
+    """Probe an actual app/vault command, not merely the CLI executable version."""
+    started = time.monotonic()
+    text, failed = run_obsidian("vault", {**args, "info": "name"}, trace=trace)
+    # Some CLI failures can be printed with exit status zero.
+    responsive = not failed and bool(text.strip()) and not text.lstrip().lower().startswith("error")
+    result = {"server": "ok", "obsidian_vault": "responsive" if responsive else "unavailable",
+              "timeout_seconds": TIMEOUT_SECONDS,
+              "elapsed_ms": round((time.monotonic() - started) * 1000)}
+    if not responsive:
+        result["detail"] = text or "Obsidian returned an empty response"
+    return json.dumps(result), not responsive
 
 
 def input_schema(properties: dict[str, Any], required: list[str] | None = None) -> dict[str, Any]:
@@ -423,6 +516,7 @@ def tool(name: str, description: str, properties: dict[str, Any], required: list
 
 
 TOOLS = [
+    tool("health", "Check the MCP server and Obsidian vault connection within the command timeout.", {}),
     tool("search", "Read-only Obsidian keyword search.", {"query": STRING, "limit": {"type": "integer", "minimum": 1, "maximum": MAX_LIMIT, "default": 10}, "path": STRING, **FORMAT_TEXT_JSON, "case_sensitive": {"type": "boolean", "default": False}, "total": BOOLS["total"]}, ["query"]),
     tool("search_context", "Read-only Obsidian search with surrounding line context.", {"query": STRING, "limit": {"type": "integer", "minimum": 1, "maximum": MAX_LIMIT, "default": 5}, "path": STRING, **FORMAT_TEXT_JSON, "case_sensitive": {"type": "boolean", "default": False}}, ["query"]),
     tool("read", "Read a note.", TARGET),
@@ -486,7 +580,7 @@ def write_message(message: dict[str, Any]) -> None:
     sys.stdout.flush()
 
 
-def handle_request(message: dict[str, Any]) -> dict[str, Any] | None:
+def handle_request(message: dict[str, Any], *, trace: str | None = None) -> dict[str, Any] | None:
     request_id = message.get("id")
     if request_id is None:
         return None
@@ -505,7 +599,8 @@ def handle_request(message: dict[str, Any]) -> dict[str, Any] | None:
             args = params.get("arguments") or {}
             if not isinstance(name, str) or not isinstance(args, dict):
                 raise McpError(-32602, "tools/call requires name and object arguments")
-            text, is_error = run_obsidian(name, args)
+            text, is_error = (health(args, trace=trace) if name == "health"
+                              else run_obsidian(name, args, trace=trace))
             return {"jsonrpc": "2.0", "id": request_id, "result": {"content": [{"type": "text", "text": text}], "isError": is_error}}
         raise McpError(-32601, f"unknown method: {method}")
     except McpError as exc:
@@ -515,16 +610,32 @@ def handle_request(message: dict[str, Any]) -> dict[str, Any] | None:
 
 
 def main() -> int:
+    configure_logging()
+    diagnostic("server_started", timeout_seconds=TIMEOUT_SECONDS)
     for line in sys.stdin:
         line = line.strip()
         if not line:
             continue
+        trace = uuid.uuid4().hex
+        started = time.monotonic()
+        diagnostic("request_received", trace=trace)
         try:
-            response = handle_request(json.loads(line))
+            message = json.loads(line)
+            if not isinstance(message, dict):
+                response = {"jsonrpc": "2.0", "id": None,
+                            "error": {"code": -32600, "message": "request must be an object"}}
+            else:
+                response = handle_request(message, trace=trace)
         except json.JSONDecodeError as exc:
             response = {"jsonrpc": "2.0", "id": None, "error": {"code": -32700, "message": str(exc)}}
         if response is not None:
             write_message(response)
+            diagnostic("response_sent", trace=trace,
+                       failed=("error" in response or response.get("result", {}).get("isError", False)),
+                       elapsed_ms=round((time.monotonic() - started) * 1000))
+        else:
+            diagnostic("notification_processed", trace=trace)
+    diagnostic("server_stopped")
     return 0
 
 
