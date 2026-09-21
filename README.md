@@ -270,3 +270,68 @@ Diagnostics and workflow regression tests run without Obsidian:
 ```bash
 PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=src python3 -m unittest discover -s tests -v
 ```
+
+## Bounded retrieval and batches
+
+`read` accepts either `heading` (exact ATX Markdown heading text without the
+leading `#`, including subsections), or `start_line` / `end_line` (1-based,
+inclusive). Full reads are unchanged. Use `outline` to discover headings and
+`search_context` to find line numbers. Duplicate headings require a line range.
+Setext headings are not matched by `heading`; use a line range for those.
+Fenced code and YAML frontmatter are excluded from heading matching.
+The MCP still fetches the note through Obsidian and filters it before returning
+it; it does not cache notes or fall back to disk. A truncated source is rejected
+for partial reads rather than silently returning an incomplete section.
+
+```json
+{"path":"Notes/GPU.md","heading":"Memory hierarchy"}
+```
+
+```json
+{"path":"Notes/GPU.md","start_line":20,"end_line":50}
+```
+
+`batch` accepts 1–8 independent read-only calls. Results retain input order and
+have individual `isError` flags. It runs commands sequentially under one shared
+command timeout and output budget; nesting and unknown tools are rejected.
+Arguments (including `vault` when supported) belong on each child call. Budget
+exhaustion returns explicit errors for omitted results. Prefer narrow searches
+and selected sections over batching many full documents. Batching reduces MCP
+call overhead, not the number of underlying CLI operations by itself.
+
+```json
+{"calls":[{"tool":"outline","arguments":{"path":"Notes/GPU.md"}},{"tool":"links","arguments":{"path":"Notes/GPU.md"}}]}
+```
+
+The runtime exposes `run_command` and `main(request_handler)` so a project adapter
+can retain stricter schemas and a pinned vault while reusing logging and timeout
+fixes. Updating a repository checkout affects new server processes; already
+running servers must restart. Detached script copies do not update automatically.
+
+## Protocol compatibility
+
+This server uses local stdio and the legacy `initialize` handshake. It does not
+store conversation history or note caches, but it has not implemented the modern
+2026-07-28 stateless wire protocol (`server/discover` and per-request metadata).
+Initialization negotiates a supported legacy version instead of echoing an
+unsupported modern version. No HTTP endpoint or session service is introduced.
+
+## Evaluating real tool use
+
+Unit tests verify correctness; they cannot establish whether an agent chooses a
+tool or produces a better answer. Use a fresh, read-only agent session with a
+fixed task/model and `codex exec --json`, keeping the prompt independent of the
+feature being evaluated. Save traces outside the repo: they contain private note
+contents. Run the same prompt with baseline and candidate tool catalogs, then:
+
+```bash
+python3 scripts/summarize_trace.py /path/to/run.jsonl --server-log /path/to/server.log
+```
+
+The summary excludes note text and arguments. Compare logical operations as well
+as MCP calls, partial-read use, output size, budget/error events, cached versus
+uncached input tokens, and a manually scored answer-quality rubric. Repeat tasks
+before claiming stable savings. Suggested fixtures: a short note, a long lecture
+with relevant subsections, ambiguous headings, a missing note, a timeout, and a
+large search response. Check that conclusions remain supported, contradictory
+notes are noticed, and missing/error results are not treated as evidence.

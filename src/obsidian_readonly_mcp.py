@@ -6,6 +6,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -13,7 +14,7 @@ import time
 import uuid
 from logging.handlers import RotatingFileHandler
 from pathlib import Path, PurePosixPath
-from typing import Any
+from typing import Any, Callable
 
 
 DEFAULT_VAULT = os.environ.get("OBSIDIAN_READONLY_VAULT", "")
@@ -64,6 +65,14 @@ def configure_logging() -> None:
 def diagnostic(event: str, **fields: Any) -> None:
     LOGGER.info(json.dumps({"timestamp": time.time(), "pid": os.getpid(),
                             "event": event, **fields}))
+
+
+LEGACY_PROTOCOL_VERSIONS = ("2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05")
+
+
+def legacy_protocol_version(requested: str) -> str:
+    # Do not claim modern server/discover support by echoing an unknown revision.
+    return requested if requested in LEGACY_PROTOCOL_VERSIONS else LEGACY_PROTOCOL_VERSIONS[0]
 
 
 class McpError(Exception):
@@ -431,10 +440,126 @@ def build_argv(tool: str, args: dict[str, Any]) -> list[str]:
     raise McpError(-32601, f"unknown tool: {tool}")
 
 
-def run_obsidian(tool: str, args: dict[str, Any], *, trace: str | None = None) -> tuple[str, bool]:
-    argv = build_argv(tool, args)
+READ_SELECTION = {
+    "heading": {"type": "string", "description": "Exact ATX (#) Markdown heading text; includes subsections. Duplicates require a line range."},
+    "start_line": {"type": "integer", "minimum": 1, "description": "First line, 1-based inclusive."},
+    "end_line": {"type": "integer", "minimum": 1, "description": "Last line, 1-based inclusive; clipped to EOF."},
+}
+
+
+def validate_selection(args: dict[str, Any]) -> None:
+    if "heading" in args:
+        if not isinstance(args["heading"], str) or not args["heading"] or any(k in args for k in ("start_line", "end_line")):
+            raise McpError(-32602, "Provide heading OR a line range")
+    for key in ("start_line", "end_line"):
+        if key in args and (type(args[key]) is not int or args[key] < 1):
+            raise McpError(-32602, "Line numbers must be positive integers")
+    if "end_line" in args and args["end_line"] < args.get("start_line", 1):
+        raise McpError(-32602, "end_line precedes start_line")
+
+
+def select_text(text: str, args: dict[str, Any]) -> str:
+    validate_selection(args)
+    lines = text.splitlines(keepends=True)
+    heading = args.get('heading')
+    start, end = args.get('start_line', 1), args.get('end_line', len(lines))
+    if heading is not None:
+        headings = []
+        fence = None
+        frontmatter = bool(lines and lines[0].strip() == "---")
+        for index, line in enumerate(lines):
+            if frontmatter:
+                if index > 0 and line.strip() in {"---", "..."}:
+                    frontmatter = False
+                continue
+            mark = re.match(r'^ {0,3}(`{3,}|~{3,})', line)
+            if mark:
+                token = mark[1]
+                if fence is None:
+                    fence = token
+                elif token[0] == fence[0] and len(token) >= len(fence) and not line[mark.end():].strip():
+                    fence = None
+                continue
+            if fence is not None:
+                continue
+            match = re.match(r'^ {0,3}(#{1,6})[ \t]+(.+?)\s*$', line)
+            if match:
+                title = re.sub(r'[ \t]+#+[ \t]*$', '', match[2])
+                headings.append((index, len(match[1]), title))
+        found = [h for h in headings if h[2] == heading]
+        if len(found) != 1:
+            raise McpError(-32602, 'Heading missing or ambiguous; use outline or line range')
+        index, level, _ = found[0]
+        start = index + 1
+        end = next((pos for pos, depth, _ in headings if pos > index and depth <= level), len(lines))
+    if type(start) is not int or type(end) is not int or start < 1 or end < start or start > len(lines):
+        raise McpError(-32602, 'Invalid 1-based inclusive line range')
+    end = min(end, len(lines))
+    return f'[lines {start}-{end} of {len(lines)}]\n' + ''.join(lines[start-1:end])
+
+
+def run_batch(args: dict[str, Any], *, invoke: Callable[..., Any], allowed: set[str],
+              trace: str | None = None) -> tuple[str, bool]:
+    if set(args) - {"calls"}:
+        raise McpError(-32602, "Set arguments on each batch call, not on the batch")
+    calls = args.get("calls")
+    if not isinstance(calls, list) or not 1 <= len(calls) <= 8:
+        raise McpError(-32602, "batch requires 1-8 calls")
+    for call in calls:
+        if (not isinstance(call, dict) or not isinstance(call.get("tool"), str)
+                or call["tool"] not in allowed - {"batch"}
+                or not isinstance(call.get("arguments", {}), dict)):
+            raise McpError(-32602, "Invalid or nested batch call")
+    deadline = time.monotonic() + TIMEOUT_SECONDS
+    results = []
+    output_exhausted = False
+    for index, call in enumerate(calls):
+        remaining = deadline - time.monotonic()
+        if output_exhausted:
+            text, failed = "Batch output budget exhausted; call separately", True
+        elif remaining <= 0:
+            text, failed = "Batch time budget exhausted; call separately", True
+        else:
+            try:
+                text, failed = invoke(call["tool"], call.get("arguments", {}),
+                                      trace=f"{trace}:{index}", timeout_seconds=remaining)
+            except McpError as exc:
+                text, failed = exc.message, True
+        entry = {"tool": call["tool"], "text": text, "isError": failed}
+        # Measure the serialized envelope too; never silently drop a requested result.
+        if len(json.dumps(results + [entry]).encode()) > MAX_OUTPUT_BYTES - 2048:
+            entry.update(text="Batch output budget exhausted; call separately", isError=True)
+            output_exhausted = True
+        results.append(entry)
+    return json.dumps(results), any(item["isError"] for item in results)
+
+
+def call_tool(name: str, args: dict[str, Any], *, trace: str | None = None,
+              timeout_seconds: float | None = None) -> tuple[str, bool]:
+    if name == "batch":
+        return run_batch(args, invoke=call_tool, allowed={tool["name"] for tool in TOOLS}, trace=trace)
+    if name == "health":
+        return health(args, trace=trace, timeout_seconds=timeout_seconds)
+    return run_obsidian(name, args, trace=trace, timeout_seconds=timeout_seconds)
+
+
+def run_obsidian(tool: str, args: dict[str, Any], *, trace: str | None = None, timeout_seconds: float | None = None) -> tuple[str, bool]:
+    if tool == "read":
+        validate_selection(args)
+    text, failed = run_command(build_argv(tool, args), tool=tool, trace=trace,
+                               timeout_seconds=timeout_seconds)
+    if tool == "read" and not failed and any(key in args for key in READ_SELECTION):
+        if "[obsidian-readonly-mcp: output truncated]" in text:
+            return "Cannot select from a truncated source; use a direct-file read", True
+        text = select_text(text, args)
+    return text, failed
+
+
+def run_command(argv: list[str], *, tool: str, trace: str | None = None, timeout_seconds: float | None = None) -> tuple[str, bool]:
+    """Execute validated argv; shared with vault-specific read-only adapters."""
+    timeout = TIMEOUT_SECONDS if timeout_seconds is None else min(TIMEOUT_SECONDS, timeout_seconds)
     started = time.monotonic()
-    diagnostic("command_started", trace=trace, tool=tool, timeout_seconds=TIMEOUT_SECONDS)
+    diagnostic("command_started", trace=trace, tool=tool, timeout_seconds=timeout)
     try:
         process = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                    start_new_session=(os.name == "posix"))
@@ -443,7 +568,7 @@ def run_obsidian(tool: str, args: dict[str, Any], *, trace: str | None = None) -
         return ("obsidian CLI not found on PATH" if isinstance(exc, FileNotFoundError)
                 else "obsidian CLI could not be started"), True
     try:
-        stdout_bytes, stderr_bytes = process.communicate(timeout=TIMEOUT_SECONDS)
+        stdout_bytes, stderr_bytes = process.communicate(timeout=timeout)
     except subprocess.TimeoutExpired:
         diagnostic("command_timeout", trace=trace, tool=tool,
                    elapsed_ms=round((time.monotonic() - started) * 1000))
@@ -465,7 +590,7 @@ def run_obsidian(tool: str, args: dict[str, Any], *, trace: str | None = None) -
                 process.stderr.close()
         diagnostic("command_cleanup", trace=trace, tool=tool, exit_code=process.poll(),
                    elapsed_ms=round((time.monotonic() - started) * 1000))
-        return f"obsidian command timed out after {TIMEOUT_SECONDS}s; check Obsidian and run health", True
+        return f"obsidian command timed out after {timeout:g}s; check Obsidian and run health", True
 
     diagnostic("command_finished", trace=trace, tool=tool, exit_code=process.returncode,
                elapsed_ms=round((time.monotonic() - started) * 1000),
@@ -477,13 +602,13 @@ def run_obsidian(tool: str, args: dict[str, Any], *, trace: str | None = None) -
         text = f"{text}\n[stderr]\n{stderr}" if text else stderr
     if len(stdout_bytes) > MAX_OUTPUT_BYTES or len(stderr_bytes) > MAX_OUTPUT_BYTES:
         text += "\n[obsidian-readonly-mcp: output truncated]\n"
-    return text, process.returncode != 0
+    return text, process.returncode != 0 or stdout.lstrip().startswith("Error:")
 
 
-def health(args: dict[str, Any], *, trace: str | None = None) -> tuple[str, bool]:
+def health(args: dict[str, Any], *, trace: str | None = None, timeout_seconds: float | None = None) -> tuple[str, bool]:
     """Probe an actual app/vault command, not merely the CLI executable version."""
     started = time.monotonic()
-    text, failed = run_obsidian("vault", {**args, "info": "name"}, trace=trace)
+    text, failed = run_obsidian("vault", {**args, "info": "name"}, trace=trace, timeout_seconds=timeout_seconds)
     # Some CLI failures can be printed with exit status zero.
     responsive = not failed and bool(text.strip()) and not text.lstrip().lower().startswith("error")
     result = {"server": "ok", "obsidian_vault": "responsive" if responsive else "unavailable",
@@ -512,14 +637,15 @@ BOOLS = {
 
 
 def tool(name: str, description: str, properties: dict[str, Any], required: list[str] | None = None) -> dict[str, Any]:
-    return {"name": name, "description": description, "inputSchema": input_schema(properties, required)}
+    return {"name": name, "description": description, "inputSchema": input_schema(properties, required),
+            "annotations": {"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False}}
 
 
 TOOLS = [
     tool("health", "Check the MCP server and Obsidian vault connection within the command timeout.", {}),
     tool("search", "Read-only Obsidian keyword search.", {"query": STRING, "limit": {"type": "integer", "minimum": 1, "maximum": MAX_LIMIT, "default": 10}, "path": STRING, **FORMAT_TEXT_JSON, "case_sensitive": {"type": "boolean", "default": False}, "total": BOOLS["total"]}, ["query"]),
     tool("search_context", "Read-only Obsidian search with surrounding line context.", {"query": STRING, "limit": {"type": "integer", "minimum": 1, "maximum": MAX_LIMIT, "default": 5}, "path": STRING, **FORMAT_TEXT_JSON, "case_sensitive": {"type": "boolean", "default": False}}, ["query"]),
-    tool("read", "Read a note.", TARGET),
+    tool("read", "Read a note. For long notes, use outline then heading, or start_line/end_line, to return only the needed portion.", {**TARGET, **READ_SELECTION}),
     tool("daily_read", "Read the daily note.", {}),
     tool("daily_path", "Return the daily note path.", {}),
     tool("backlinks", "List backlinks to a note.", {**TARGET, "counts": {"type": "boolean", "default": True}, "total": BOOLS["total"], "format": {"type": "string", "enum": ["json", "tsv", "csv"], "default": "json"}}),
@@ -575,6 +701,15 @@ TOOLS = [
 ]
 
 
+TOOLS.append(tool("batch", "Run 1-8 independent read-only calls in one round trip, with separate results and a shared command timeout. No nested batches.", {
+    "calls": {"type": "array", "minItems": 1, "maxItems": 8, "items": {
+        "type": "object", "properties": {
+            "tool": {"type": "string", "enum": [item["name"] for item in TOOLS]},
+            "arguments": {"type": "object"}}, "required": ["tool", "arguments"], "additionalProperties": False}}}, ["calls"]))
+
+TOOLS[-1]["inputSchema"]["properties"].pop("vault")
+
+
 def write_message(message: dict[str, Any]) -> None:
     sys.stdout.write(json.dumps(message, separators=(",", ":")) + "\n")
     sys.stdout.flush()
@@ -587,7 +722,7 @@ def handle_request(message: dict[str, Any], *, trace: str | None = None) -> dict
     method = message.get("method")
     try:
         if method == "initialize":
-            version = (message.get("params") or {}).get("protocolVersion", "2024-11-05")
+            version = legacy_protocol_version((message.get("params") or {}).get("protocolVersion", "2024-11-05"))
             return {"jsonrpc": "2.0", "id": request_id, "result": {"protocolVersion": version, "capabilities": {"tools": {}}, "serverInfo": {"name": "obsidian-readonly", "version": "0.1.0"}}}
         if method == "ping":
             return {"jsonrpc": "2.0", "id": request_id, "result": {}}
@@ -599,8 +734,7 @@ def handle_request(message: dict[str, Any], *, trace: str | None = None) -> dict
             args = params.get("arguments") or {}
             if not isinstance(name, str) or not isinstance(args, dict):
                 raise McpError(-32602, "tools/call requires name and object arguments")
-            text, is_error = (health(args, trace=trace) if name == "health"
-                              else run_obsidian(name, args, trace=trace))
+            text, is_error = call_tool(name, args, trace=trace)
             return {"jsonrpc": "2.0", "id": request_id, "result": {"content": [{"type": "text", "text": text}], "isError": is_error}}
         raise McpError(-32601, f"unknown method: {method}")
     except McpError as exc:
@@ -609,7 +743,7 @@ def handle_request(message: dict[str, Any], *, trace: str | None = None) -> dict
         return {"jsonrpc": "2.0", "id": request_id, "error": {"code": -32603, "message": str(exc)}}
 
 
-def main() -> int:
+def main(request_handler: Callable[..., Any] = handle_request) -> int:
     configure_logging()
     diagnostic("server_started", timeout_seconds=TIMEOUT_SECONDS)
     for line in sys.stdin:
@@ -625,7 +759,7 @@ def main() -> int:
                 response = {"jsonrpc": "2.0", "id": None,
                             "error": {"code": -32600, "message": "request must be an object"}}
             else:
-                response = handle_request(message, trace=trace)
+                response = request_handler(message, trace=trace)
         except json.JSONDecodeError as exc:
             response = {"jsonrpc": "2.0", "id": None, "error": {"code": -32700, "message": str(exc)}}
         if response is not None:

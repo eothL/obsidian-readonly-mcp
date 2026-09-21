@@ -51,7 +51,7 @@ class DiagnosticsTest(unittest.TestCase):
             with patch.object(server, 'run_obsidian', return_value=(output, command_failed)) as run:
                 response = server.handle_request({'id': 1, 'method': 'tools/call', 'params': {'name': 'health', 'arguments': {'vault': 'local'}}})
             self.assertEqual(response['result']['isError'], expected_failed)
-            run.assert_called_once_with('vault', {'vault': 'local', 'info': 'name'}, trace=None)
+            run.assert_called_once_with('vault', {'vault': 'local', 'info': 'name'}, trace=None, timeout_seconds=None)
         listed = server.handle_request({'id': 2, 'method': 'tools/list'})
         self.assertIn('health', {t['name'] for t in listed['result']['tools']})
 
