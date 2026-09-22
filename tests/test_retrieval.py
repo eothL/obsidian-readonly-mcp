@@ -25,6 +25,9 @@ Warps hide latency.
 
 
 class RetrievalTest(unittest.TestCase):
+    def setUp(self):
+        server.FAILURES.clear()
+
     def test_heading_includes_children_and_excludes_next_peer(self):
         result = server.select_text(NOTE, {'heading': 'Memory'})
         self.assertIn('HBM → cache', result)

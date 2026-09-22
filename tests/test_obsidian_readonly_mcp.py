@@ -16,6 +16,9 @@ import obsidian_readonly_mcp as server
 
 
 class DiagnosticsTest(unittest.TestCase):
+    def setUp(self):
+        server.FAILURES.clear()
+
     def test_success_and_nonzero_exit_keep_output(self):
         for code in (0, 2):
             argv = [sys.executable, '-c', f'import sys; print("note-secret"); print("error-secret", file=sys.stderr); sys.exit({code})']
@@ -44,14 +47,14 @@ class DiagnosticsTest(unittest.TestCase):
         self.assertIn('timed out', text)
         self.assertLess(time.monotonic() - started, 2)
         with patch.object(server, 'build_argv', return_value=[sys.executable, '-c', 'print("recovered")']):
-            self.assertEqual(server.run_obsidian('read', {}), ('recovered\n', False))
+            self.assertEqual(server.run_obsidian('read', {}, probe=True), ('recovered\n', False))
 
     def test_health_checks_vault_and_reports_failures(self):
         for output, command_failed, expected_failed in [('local', False, False), ('Error: app unavailable', False, True), ('', False, True), ('timeout', True, True)]:
             with patch.object(server, 'run_obsidian', return_value=(output, command_failed)) as run:
                 response = server.handle_request({'id': 1, 'method': 'tools/call', 'params': {'name': 'health', 'arguments': {'vault': 'local'}}})
             self.assertEqual(response['result']['isError'], expected_failed)
-            run.assert_called_once_with('vault', {'vault': 'local', 'info': 'name'}, trace=None, timeout_seconds=None)
+            run.assert_called_once_with('vault', {'vault': 'local', 'info': 'name'}, trace=None, timeout_seconds=None, probe=True)
         listed = server.handle_request({'id': 2, 'method': 'tools/list'})
         self.assertIn('health', {t['name'] for t in listed['result']['tools']})
 

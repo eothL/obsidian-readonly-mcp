@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import re
 import signal
@@ -24,6 +25,35 @@ TIMEOUT_SECONDS = int(os.environ.get("OBSIDIAN_READONLY_TIMEOUT_SECONDS", "30"))
 
 if TIMEOUT_SECONDS <= 0:
     raise ValueError("OBSIDIAN_READONLY_TIMEOUT_SECONDS must be positive")
+
+COOLDOWN_SECONDS = int(os.environ.get("OBSIDIAN_READONLY_COOLDOWN_SECONDS", "60"))
+if COOLDOWN_SECONDS < 0:
+    raise ValueError("OBSIDIAN_READONLY_COOLDOWN_SECONDS must be non-negative")
+# Bounded per-vault infrastructure health, not conversation or note state.
+FAILURES: dict[str, tuple[int, float]] = {}
+
+
+def record_failure(key: str, *, trace: str | None = None) -> None:
+    if not COOLDOWN_SECONDS:
+        return
+    count = FAILURES.get(key, (0, 0.0))[0] + 1
+    until = time.monotonic() + COOLDOWN_SECONDS if count >= 2 else 0.0
+    FAILURES[key] = (count, until)
+    if len(FAILURES) > 64:
+        del FAILURES[next(iter(FAILURES))]
+    if until:
+        diagnostic("cooldown_opened", trace=trace, retry_after_seconds=COOLDOWN_SECONDS)
+
+
+def cooldown_remaining(key: str) -> int:
+    if not COOLDOWN_SECONDS:
+        return 0
+    count, until = FAILURES.get(key, (0, 0.0))
+    if until and until <= time.monotonic():
+        FAILURES.pop(key, None)
+        return 0
+    return max(0, math.ceil(until - time.monotonic()))
+
 
 LOGGER = logging.getLogger("obsidian-readonly-mcp")
 LOGGER.addHandler(logging.NullHandler())
@@ -543,20 +573,26 @@ def call_tool(name: str, args: dict[str, Any], *, trace: str | None = None,
     return run_obsidian(name, args, trace=trace, timeout_seconds=timeout_seconds)
 
 
-def run_obsidian(tool: str, args: dict[str, Any], *, trace: str | None = None, timeout_seconds: float | None = None) -> tuple[str, bool]:
+def run_obsidian(tool: str, args: dict[str, Any], *, trace: str | None = None, timeout_seconds: float | None = None, probe: bool = False) -> tuple[str, bool]:
     if tool == "read":
         validate_selection(args)
     text, failed = run_command(build_argv(tool, args), tool=tool, trace=trace,
-                               timeout_seconds=timeout_seconds)
+                               timeout_seconds=timeout_seconds, probe=probe)
     if tool == "read" and not failed and any(key in args for key in READ_SELECTION):
         if "[obsidian-readonly-mcp: output truncated]" in text:
-            return "Cannot select from a truncated source; use a direct-file read", True
+            return "Cannot select from a truncated source; narrow the query or adjust the configured output limit", True
         text = select_text(text, args)
     return text, failed
 
 
-def run_command(argv: list[str], *, tool: str, trace: str | None = None, timeout_seconds: float | None = None) -> tuple[str, bool]:
+def run_command(argv: list[str], *, tool: str, trace: str | None = None, timeout_seconds: float | None = None, probe: bool = False) -> tuple[str, bool]:
     """Execute validated argv; shared with vault-specific read-only adapters."""
+    key = next((arg for arg in argv[1:] if arg.startswith("vault=")), "default-vault")
+    remaining = cooldown_remaining(key)
+    if remaining and not probe:
+        diagnostic("cooldown_rejected", trace=trace, tool=tool, retry_after_seconds=remaining)
+        return json.dumps({"status": "cooldown", "retry_after_seconds": remaining,
+                           "message": "Obsidian is temporarily unavailable. Stop retries until the cooldown expires; after fixing the connection, use one health check. No fallback was run."}), True
     timeout = TIMEOUT_SECONDS if timeout_seconds is None else min(TIMEOUT_SECONDS, timeout_seconds)
     started = time.monotonic()
     diagnostic("command_started", trace=trace, tool=tool, timeout_seconds=timeout)
@@ -564,12 +600,14 @@ def run_command(argv: list[str], *, tool: str, trace: str | None = None, timeout
         process = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                    start_new_session=(os.name == "posix"))
     except OSError as exc:
+        record_failure(key, trace=trace)
         diagnostic("command_failed", trace=trace, tool=tool, error_type=type(exc).__name__)
         return ("obsidian CLI not found on PATH" if isinstance(exc, FileNotFoundError)
                 else "obsidian CLI could not be started"), True
     try:
         stdout_bytes, stderr_bytes = process.communicate(timeout=timeout)
     except subprocess.TimeoutExpired:
+        record_failure(key, trace=trace)
         diagnostic("command_timeout", trace=trace, tool=tool,
                    elapsed_ms=round((time.monotonic() - started) * 1000))
         # Kill only the CLI's new process group, including helpers holding its pipes.
@@ -602,13 +640,19 @@ def run_command(argv: list[str], *, tool: str, trace: str | None = None, timeout
         text = f"{text}\n[stderr]\n{stderr}" if text else stderr
     if len(stdout_bytes) > MAX_OUTPUT_BYTES or len(stderr_bytes) > MAX_OUTPUT_BYTES:
         text += "\n[obsidian-readonly-mcp: output truncated]\n"
-    return text, process.returncode != 0 or stdout.lstrip().startswith("Error:")
+    failed = process.returncode != 0 or stdout.lstrip().startswith("Error:")
+    lookup_error = stdout.lstrip().startswith(("Error: File ", "Error: Folder ", "Error: Property ", "Error: Heading "))
+    if (failed and not lookup_error) or (probe and not stdout.strip()):
+        record_failure(key, trace=trace)
+    else:
+        FAILURES.pop(key, None)
+    return text, failed
 
 
 def health(args: dict[str, Any], *, trace: str | None = None, timeout_seconds: float | None = None) -> tuple[str, bool]:
     """Probe an actual app/vault command, not merely the CLI executable version."""
     started = time.monotonic()
-    text, failed = run_obsidian("vault", {**args, "info": "name"}, trace=trace, timeout_seconds=timeout_seconds)
+    text, failed = run_obsidian("vault", {**args, "info": "name"}, trace=trace, timeout_seconds=timeout_seconds, probe=True)
     # Some CLI failures can be printed with exit status zero.
     responsive = not failed and bool(text.strip()) and not text.lstrip().lower().startswith("error")
     result = {"server": "ok", "obsidian_vault": "responsive" if responsive else "unavailable",

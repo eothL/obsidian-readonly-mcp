@@ -44,3 +44,24 @@ Gap: Note A has backlinks but no outgoing links
 These tools are read-only. Do not attempt to create, edit, delete, move, rename, append, prepend, set properties, install plugins, reload the app, execute commands, open files, run arbitrary eval, or access the network.
 
 If the MCP tools are unavailable, report that the `obsidian_readonly` MCP server is not loaded. Do not work around missing MCP tools with raw `obsidian` from a sandboxed agent.
+
+## Bounded retrieval and failures
+
+- Group up to 8 independent lookups with `batch`; put arguments on each child.
+  Inspect every child result. An output/time-budget error is missing evidence,
+  not an empty result. Narrow the query or request only the missing portion.
+- For long notes, use `outline` then `read` with an exact ATX (`#`) `heading`,
+  including its subsections; or use inclusive 1-based `start_line`/`end_line`.
+  Use line ranges for duplicate or Setext headings. Retrieve properties separately
+  if a selected section omits frontmatter needed to interpret the note.
+- After two infrastructure failures, the MCP returns `status: cooldown` with
+  `retry_after_seconds` (60 seconds by default), without launching more CLI calls.
+  Stop retrying the same backend, including through batches or other tool names.
+  Continue independent work. After the connection is fixed, use one `health`
+  probe; a successful probe clears the cooldown. Do not repeatedly poll health.
+- Missing notes and invalid arguments do not trigger the infrastructure cooldown.
+  Distinguish them from unavailable tools, a timeout, and budget exhaustion.
+- Do not replace failed/unavailable MCP reads with Bash, raw Obsidian CLI, `cat`,
+  `rg`, or direct-file reads. Report the limitation; no automatic disk fallback
+  or note cache is used. This restriction concerns vault retrieval, not inspection
+  of MCP source/configuration when explicitly troubleshooting it.

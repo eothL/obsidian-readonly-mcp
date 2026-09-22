@@ -335,3 +335,25 @@ before claiming stable savings. Suggested fixtures: a short note, a long lecture
 with relevant subsections, ambiguous headings, a missing note, a timeout, and a
 large search response. Check that conclusions remain supported, contradictory
 notes are noticed, and missing/error results are not treated as evidence.
+
+## Failure cooldown
+
+After two consecutive infrastructure failures for the same vault, commands return
+an immediate tool error with `status: cooldown` and `retry_after_seconds`. The
+process does not sleep or launch more CLI subprocesses during the pause, including
+for children of a batch. `OBSIDIAN_READONLY_COOLDOWN_SECONDS` defaults to `60`;
+set it to `0` to disable. Counters are process-local, per vault, and bounded to 64
+vault entries. Expiry permits another attempt; successful execution clears the
+failure streak. A deliberate `health` call bypasses the pause and clears it if
+successful. Repeated health polling defeats this protection.
+
+Launch failures, command timeouts and infrastructure command errors count. Input
+validation failures and recognized missing-file/folder/property/heading responses
+do not. No missing note is treated as proof that the Obsidian app is broken.
+Cooldown state contains no note data or conversation history; it is operational
+health state, compatible with a future stateless protocol implementation.
+
+The MCP always executes the Obsidian CLI directly (argv, no shell). It does not
+replace failures with Bash commands, direct `.md` reads, or cached notes. The
+companion skills likewise instruct agents to report unavailability and respect
+the retry interval instead of falling back to direct filesystem retrieval.
