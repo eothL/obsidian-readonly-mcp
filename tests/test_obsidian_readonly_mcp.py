@@ -81,16 +81,16 @@ class DiagnosticsTest(unittest.TestCase):
 
     def test_stdio_protocol_and_correlated_logs(self):
         with tempfile.TemporaryDirectory() as directory:
-            messages = [{'id': 1, 'method': 'ping'}, {'id': 2, 'method': 'tools/list'}, []]
+            messages = [{'jsonrpc': '2.0', 'id': 1, 'method': 'initialize'}, {'jsonrpc': '2.0', 'id': 2, 'method': 'tools/list'}, []]
             result = subprocess.run([sys.executable, server.__file__], input='\n'.join(map(json.dumps, messages))+'\n', text=True, capture_output=True, timeout=3, env={**os.environ, 'OBSIDIAN_READONLY_LOG_DIR': directory})
             self.assertEqual(result.returncode, 0)
             responses = list(map(json.loads, result.stdout.splitlines()))
             self.assertEqual(len(responses), 3)
-            self.assertEqual(responses[-1]['error']['code'], -32600)
+            self.assertEqual(next(r for r in responses if r['id'] is None)['error']['code'], -32600)
             events = [json.loads(line) for line in (Path(directory) / 'server.log').read_text().splitlines()]
             received = [e['trace'] for e in events if e['event'] == 'request_received']
             sent = [e['trace'] for e in events if e['event'] == 'response_sent']
-            self.assertEqual(received, sent)
+            self.assertCountEqual(received, sent)
 
     def test_log_failure_does_not_break_protocol(self):
         with tempfile.TemporaryDirectory() as directory:

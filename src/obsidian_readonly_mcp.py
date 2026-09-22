@@ -7,10 +7,12 @@ import json
 import logging
 import math
 import os
+import queue
 import re
 import signal
 import subprocess
 import sys
+import threading
 import time
 import uuid
 from logging.handlers import RotatingFileHandler
@@ -98,6 +100,21 @@ def diagnostic(event: str, **fields: Any) -> None:
 
 
 LEGACY_PROTOCOL_VERSIONS = ("2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05")
+PROTOCOL_VERSION = "2026-07-28"
+SUPPORTED_VERSIONS = (PROTOCOL_VERSION, *LEGACY_PROTOCOL_VERSIONS)
+META_PREFIX = "io.modelcontextprotocol/"
+SERVER_INFO = {"name": "obsidian-readonly", "version": "0.1.0+protocol.2026-07-28"}
+REQUEST_CONTEXT = threading.local()
+
+
+class RequestCancelled(Exception):
+    pass
+
+
+def check_cancelled() -> None:
+    event = getattr(REQUEST_CONTEXT, "cancelled", None)
+    if event is not None and event.is_set():
+        raise RequestCancelled()
 
 
 def legacy_protocol_version(requested: str) -> str:
@@ -106,10 +123,11 @@ def legacy_protocol_version(requested: str) -> str:
 
 
 class McpError(Exception):
-    def __init__(self, code: int, message: str) -> None:
+    def __init__(self, code: int, message: str, data: Any = None) -> None:
         super().__init__(message)
         self.code = code
         self.message = message
+        self.data = data
 
 
 def s(args: dict[str, Any], key: str, *, required: bool = False) -> str | None:
@@ -587,6 +605,7 @@ def run_obsidian(tool: str, args: dict[str, Any], *, trace: str | None = None, t
 
 def run_command(argv: list[str], *, tool: str, trace: str | None = None, timeout_seconds: float | None = None, probe: bool = False) -> tuple[str, bool]:
     """Execute validated argv; shared with vault-specific read-only adapters."""
+    check_cancelled()
     key = next((arg for arg in argv[1:] if arg.startswith("vault=")), "default-vault")
     remaining = cooldown_remaining(key)
     if remaining and not probe:
@@ -605,10 +624,26 @@ def run_command(argv: list[str], *, tool: str, trace: str | None = None, timeout
         return ("obsidian CLI not found on PATH" if isinstance(exc, FileNotFoundError)
                 else "obsidian CLI could not be started"), True
     try:
-        stdout_bytes, stderr_bytes = process.communicate(timeout=timeout)
-    except subprocess.TimeoutExpired:
-        record_failure(key, trace=trace)
-        diagnostic("command_timeout", trace=trace, tool=tool,
+        if getattr(REQUEST_CONTEXT, "cancelled", None) is None:
+            stdout_bytes, stderr_bytes = process.communicate(timeout=timeout)
+        else:
+            deadline = time.monotonic() + timeout
+            while True:
+                check_cancelled()
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise subprocess.TimeoutExpired(argv, timeout)
+                try:
+                    stdout_bytes, stderr_bytes = process.communicate(timeout=min(0.1, remaining))
+                    break
+                except subprocess.TimeoutExpired:
+                    continue
+            check_cancelled()
+    except (subprocess.TimeoutExpired, RequestCancelled) as exc:
+        cancelled = isinstance(exc, RequestCancelled)
+        if not cancelled:
+            record_failure(key, trace=trace)
+        diagnostic("command_cancelled" if cancelled else "command_timeout", trace=trace, tool=tool,
                    elapsed_ms=round((time.monotonic() - started) * 1000))
         # Kill only the CLI's new process group, including helpers holding its pipes.
         try:
@@ -628,6 +663,8 @@ def run_command(argv: list[str], *, tool: str, trace: str | None = None, timeout
                 process.stderr.close()
         diagnostic("command_cleanup", trace=trace, tool=tool, exit_code=process.poll(),
                    elapsed_ms=round((time.monotonic() - started) * 1000))
+        if cancelled:
+            raise
         return f"obsidian command timed out after {timeout:g}s; check Obsidian and run health", True
 
     diagnostic("command_finished", trace=trace, tool=tool, exit_code=process.returncode,
@@ -759,30 +796,89 @@ def write_message(message: dict[str, Any]) -> None:
     sys.stdout.flush()
 
 
-def handle_request(message: dict[str, Any], *, trace: str | None = None) -> dict[str, Any] | None:
+def modern_request(method: str, params: dict[str, Any]) -> bool:
+    """Validate each modern request independently; retain legacy wire support."""
+    meta = params.get("_meta", {})
+    if not isinstance(meta, dict):
+        raise McpError(-32602, "_meta must be an object")
+    modern = method == "server/discover" or any(
+        META_PREFIX + key in meta for key in ("protocolVersion", "clientCapabilities", "clientInfo", "logLevel"))
+    if not modern:
+        return False
+    version = meta.get(META_PREFIX + "protocolVersion")
+    if not isinstance(version, str):
+        raise McpError(-32602, "Modern requests require protocolVersion in _meta")
+    if version != PROTOCOL_VERSION:
+        raise McpError(-32022, "Unsupported protocol version for per-request metadata",
+                       {"supported": list(SUPPORTED_VERSIONS), "requested": version})
+    capabilities = meta.get(META_PREFIX + "clientCapabilities")
+    if not isinstance(capabilities, dict):
+        raise McpError(-32602, "Modern requests require object clientCapabilities in _meta")
+    # Unknown capabilities are permitted; known ones must have their specified shape.
+    for key in ("roots", "sampling", "elicitation", "experimental", "extensions"):
+        if key not in capabilities:
+            continue
+        value = capabilities[key]
+        if not isinstance(value, dict):
+            raise McpError(-32602, f"clientCapabilities.{key} must be an object")
+        children = {"sampling": ("context", "tools"), "elicitation": ("form", "url")}.get(key, ())
+        if key in {"experimental", "extensions"}:
+            children = value.keys()
+        if any(not isinstance(value[child], dict) for child in children if child in value):
+            raise McpError(-32602, f"Invalid clientCapabilities.{key} settings")
+    info = meta.get(META_PREFIX + "clientInfo")
+    if META_PREFIX + "clientInfo" in meta and (
+            not isinstance(info, dict) or any(not isinstance(info.get(k), str) for k in ("name", "version"))):
+        raise McpError(-32602, "clientInfo requires string name and version")
+    return True
+
+
+def handle_request(message: dict[str, Any], *, trace: str | None = None,
+                   tools: list[dict[str, Any]] | None = None,
+                   invoke: Callable[..., Any] | None = None) -> dict[str, Any] | None:
     request_id = message.get("id")
     if request_id is None:
         return None
     method = message.get("method")
     try:
-        if method == "initialize":
-            version = legacy_protocol_version((message.get("params") or {}).get("protocolVersion", "2024-11-05"))
-            return {"jsonrpc": "2.0", "id": request_id, "result": {"protocolVersion": version, "capabilities": {"tools": {}}, "serverInfo": {"name": "obsidian-readonly", "version": "0.1.0"}}}
-        if method == "ping":
-            return {"jsonrpc": "2.0", "id": request_id, "result": {}}
-        if method == "tools/list":
-            return {"jsonrpc": "2.0", "id": request_id, "result": {"tools": TOOLS}}
-        if method == "tools/call":
-            params = message.get("params") or {}
+        params = message.get("params", {})
+        if not isinstance(params, dict):
+            raise McpError(-32602, "params must be an object")
+        modern = modern_request(method, params)
+        catalog = TOOLS if tools is None else tools
+        if method == "initialize" and not modern:
+            version = legacy_protocol_version(params.get("protocolVersion", "2024-11-05"))
+            result = {"protocolVersion": version, "capabilities": {"tools": {}}, "serverInfo": SERVER_INFO}
+        elif method == "ping" and not modern:
+            result = {}
+        elif method == "server/discover":
+            result = {"supportedVersions": list(SUPPORTED_VERSIONS), "capabilities": {"tools": {}},
+                      "_meta": {META_PREFIX + "serverInfo": SERVER_INFO}, "ttlMs": 0, "cacheScope": "private"}
+        elif method == "tools/list":
+            result = {"tools": catalog}
+            if modern:
+                result.update(ttlMs=0, cacheScope="private")
+        elif method == "tools/call":
             name = params.get("name")
-            args = params.get("arguments") or {}
+            args = params.get("arguments", {})
             if not isinstance(name, str) or not isinstance(args, dict):
                 raise McpError(-32602, "tools/call requires name and object arguments")
-            text, is_error = call_tool(name, args, trace=trace)
-            return {"jsonrpc": "2.0", "id": request_id, "result": {"content": [{"type": "text", "text": text}], "isError": is_error}}
-        raise McpError(-32601, f"unknown method: {method}")
+            if name not in {item["name"] for item in catalog}:
+                raise McpError(-32602, f"unknown tool: {name}")
+            text, is_error = (invoke or call_tool)(name, args, trace=trace)
+            result = {"content": [{"type": "text", "text": text}], "isError": is_error}
+        else:
+            raise McpError(-32601, f"unknown method: {method}")
+        if modern:
+            result["resultType"] = "complete"
+        return {"jsonrpc": "2.0", "id": request_id, "result": result}
     except McpError as exc:
-        return {"jsonrpc": "2.0", "id": request_id, "error": {"code": exc.code, "message": exc.message}}
+        error = {"code": exc.code, "message": exc.message}
+        if exc.data is not None:
+            error["data"] = exc.data
+        return {"jsonrpc": "2.0", "id": request_id, "error": error}
+    except RequestCancelled:
+        raise
     except Exception as exc:
         return {"jsonrpc": "2.0", "id": request_id, "error": {"code": -32603, "message": str(exc)}}
 
@@ -790,6 +886,56 @@ def handle_request(message: dict[str, Any], *, trace: str | None = None) -> dict
 def main(request_handler: Callable[..., Any] = handle_request) -> int:
     configure_logging()
     diagnostic("server_started", timeout_seconds=TIMEOUT_SECONDS)
+    # One CLI worker preserves ordering and backend health accounting. The reader
+    # remains available for cancellation; modern metadata is never retained.
+    work = queue.Queue(maxsize=64)
+    pending: dict[Any, threading.Event] = {}
+    lock = threading.Lock()
+
+    def respond(response, trace, started):
+        if response is not None:
+            write_message(response)
+            diagnostic("response_sent", trace=trace,
+                       failed=("error" in response or response.get("result", {}).get("isError", False)),
+                       elapsed_ms=round((time.monotonic() - started) * 1000))
+
+    def worker():
+        legacy_initialized = False
+        while True:
+            item = work.get()
+            if item is None:
+                return
+            message, trace, started, cancelled = item
+            request_id = message["id"]
+            REQUEST_CONTEXT.cancelled = cancelled
+            try:
+                check_cancelled()
+                if not legacy_initialized and message["method"] not in {"initialize", "ping"}:
+                    params = message.get("params", {})
+                    if not isinstance(params, dict) or not modern_request(message["method"], params):
+                        raise McpError(-32602, "Provide modern request metadata or initialize a legacy connection")
+                response = request_handler(message, trace=trace)
+                if message["method"] == "initialize" and response is not None and "result" in response:
+                    legacy_initialized = True
+                with lock:
+                    if not cancelled.is_set():
+                        respond(response, trace, started)
+            except McpError as exc:
+                error = {"code": exc.code, "message": exc.message}
+                if exc.data is not None:
+                    error["data"] = exc.data
+                with lock:
+                    if not cancelled.is_set():
+                        respond({"jsonrpc": "2.0", "id": request_id, "error": error}, trace, started)
+            except RequestCancelled:
+                diagnostic("request_cancelled", trace=trace)
+            finally:
+                with lock:
+                    pending.pop(request_id, None)
+                del REQUEST_CONTEXT.cancelled
+
+    thread = threading.Thread(target=worker, name="obsidian-cli-worker", daemon=True)
+    thread.start()
     for line in sys.stdin:
         line = line.strip()
         if not line:
@@ -799,20 +945,40 @@ def main(request_handler: Callable[..., Any] = handle_request) -> int:
         diagnostic("request_received", trace=trace)
         try:
             message = json.loads(line)
-            if not isinstance(message, dict):
-                response = {"jsonrpc": "2.0", "id": None,
-                            "error": {"code": -32600, "message": "request must be an object"}}
-            else:
-                response = request_handler(message, trace=trace)
-        except json.JSONDecodeError as exc:
-            response = {"jsonrpc": "2.0", "id": None, "error": {"code": -32700, "message": str(exc)}}
-        if response is not None:
-            write_message(response)
-            diagnostic("response_sent", trace=trace,
-                       failed=("error" in response or response.get("result", {}).get("isError", False)),
-                       elapsed_ms=round((time.monotonic() - started) * 1000))
-        else:
+        except json.JSONDecodeError:
+            with lock:
+                respond({"jsonrpc": "2.0", "id": None,
+                         "error": {"code": -32700, "message": "Invalid JSON"}}, trace, started)
+            continue
+        if (not isinstance(message, dict) or message.get("jsonrpc") != "2.0"
+                or not isinstance(message.get("method"), str)
+                or ("id" in message and type(message["id"]) not in (str, int))):
+            with lock:
+                respond({"jsonrpc": "2.0", "id": None,
+                         "error": {"code": -32600, "message": "Invalid JSON-RPC request"}}, trace, started)
+            continue
+        if "id" not in message:
+            params = message.get("params", {})
+            if message["method"] == "notifications/cancelled" and isinstance(params, dict):
+                target = params.get("requestId")
+                if type(target) in (str, int):
+                    with lock:
+                        event = pending.get(target)
+                        if event is not None:
+                            event.set()
             diagnostic("notification_processed", trace=trace)
+            continue
+        with lock:
+            request_id = message["id"]
+            if request_id in pending or len(pending) >= 64:
+                respond({"jsonrpc": "2.0", "id": request_id,
+                         "error": {"code": -32600, "message": "Duplicate ID or too many pending requests"}}, trace, started)
+                continue
+            event = threading.Event()
+            pending[request_id] = event
+            work.put_nowait((message, trace, started, event))
+    work.put(None)
+    thread.join()
     diagnostic("server_stopped")
     return 0
 

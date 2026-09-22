@@ -112,11 +112,11 @@ class RetrievalTest(unittest.TestCase):
         self.assertLess(len(text.encode()), 4096)
         self.assertEqual(len(json.loads(text)), 8)
 
-    def test_tools_stay_readonly_and_modern_version_is_not_falsely_advertised(self):
+    def test_tools_stay_readonly_and_initialize_negotiates_only_legacy(self):
         self.assertTrue(all(tool['annotations']['readOnlyHint'] for tool in server.TOOLS))
         response = server.handle_request({'id': 1, 'method': 'initialize', 'params': {'protocolVersion': '2026-07-28'}})
         self.assertEqual(response['result']['protocolVersion'], '2025-11-25')
-        self.assertEqual(server.handle_request({'id': 2, 'method': 'server/discover'})['error']['code'], -32601)
+        self.assertEqual(server.handle_request({'id': 2, 'method': 'server/discover'})['error']['code'], -32602)
 
 
 if __name__ == '__main__':
